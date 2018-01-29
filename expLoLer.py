@@ -20,7 +20,7 @@ import requests
 def api_get(endpoint: str, params: str = {}):
     """Base GET request for the Riot Games API."""
 
-    params['api_key'] = 'RGAPI-d623dbb1-7c6e-446e-8c98-c50d4bc1b1bd'
+    params['api_key'] = '<redacted>'
 
     url = 'https://na1.api.riotgames.com{}'.format(endpoint)
 
