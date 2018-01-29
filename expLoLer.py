@@ -7,6 +7,8 @@ aaronjst93@gmail.com
 """
 
 
+from multiprocessing import Lock
+from multiprocessing.pool import Pool
 from os import listdir
 from time import sleep
 
@@ -16,24 +18,31 @@ import requests
 
 
 def api_get(endpoint: str, params: str = {}):
-    """Base GET request for the LoL API."""
+    """Base GET request for the Riot Games API."""
 
-    sleep(1.2)  # Handles 100 requests / 2 minutes rate limit
-
-    params['api_key'] = '<api_key>' # censored
+    params['api_key'] = 'RGAPI-d623dbb1-7c6e-446e-8c98-c50d4bc1b1bd'
 
     url = 'https://na1.api.riotgames.com{}'.format(endpoint)
 
     response = requests.get(url, params=params)
 
+    stdo_lock.acquire()
     print(response.url)
+    stdo_lock.release()
 
     if response.status_code == requests.codes.ok:
         return response.json()
     else:
+        stdo_lock.acquire()
         print(response.content)
+        stdo_lock.release()
 
-        response.raise_for_status()
+        if response.status_code >= 500:
+            sleep(2)
+
+            return api_get(endpoint, params)
+        else:
+            response.raise_for_status()
 
 
 def get_seed_data():
@@ -73,18 +82,6 @@ def seed_accounts():
     pickle.dump(account_ids, open('seed/account_ids.pickle', 'wb'))
 
 
-def get_account_ids_from_name(*summoner_names: str):
-    """Get account_ids for provided summoner names."""
-
-    account_ids = []
-
-    for name in summoner_names:
-        data = api_get('/lol/summoner/v3/summoners/by-name/{}'.format(name))
-        account_ids.append(data['accountId'])
-
-    return list(set(account_ids))
-
-
 def get_account_ids_from_match(*matches: dict):
     """From an initial list of matches, find all account ids."""
 
@@ -103,9 +100,9 @@ def get_matchlist(account_id: str, start_index: int = 0):
     """
 
     params = {
-        'queue': 420,
+        'queue': 420,  # Ranked 5v5 Solo-Queue
         'beginIndex': start_index,
-        'season': 9
+        'season': 9  # 2017 Season
     }
 
     endpoint = '/lol/match/v3/matchlists/by-account/{}'.format(account_id)
@@ -117,8 +114,10 @@ def get_matchlist(account_id: str, start_index: int = 0):
     if data['endIndex'] < data['totalGames'] - 1:
         return match_ids + get_matchlist(account_id, data['endIndex'])
     else:
+        stdo_lock.acquire()
         print('\nAccount {} played {} matches in the 2017 season.\n'.format(
             account_id, data['totalGames']))
+        stdo_lock.release()
 
         return match_ids
 
@@ -127,17 +126,52 @@ def get_matches(*match_ids: int):
     """Get full match data for matches corresponding to ``match_ids``."""
 
     current_matches = map(int, listdir('spider/matches'))
-    new_matches = []
 
     for mid in set(match_ids) - set(current_matches):
         if mid not in current_matches:
-            match = api_get('/lol/match/v3/matches/{}'.format(mid))
+            match = None
 
+            try:
+                match = api_get('/lol/match/v3/matches/{}'.format(mid))
+            except requests.exceptions.HTTPError:
+                continue
+
+            rw_lock.acquire()
             pickle.dump(match, open('spider/matches/{}'.format(mid), 'wb'))
+            rw_lock.release()
 
-            new_matches.append(match)
 
-    return new_matches
+def get_matches_for_account(account_id: int):
+    """Get matches for given ``account_id``."""
+
+    match_ids = None
+
+    if account_id in map(int, listdir('spider/accounts')):
+        rw_lock.acquire()
+        match_ids = pickle.load(
+            open('spider/accounts/{}'.format(account_id), 'rb'))
+        rw_lock.release()
+    else:
+        try:
+            match_ids = get_matchlist(account_id)
+        except requests.exceptions.HTTPError:
+            return
+
+        rw_lock.acquire()
+        pickle.dump(match_ids,
+                    open('spider/accounts/{}'.format(account_id), 'wb'))
+        rw_lock.release()
+
+        get_matches(*match_ids)
+
+
+def initialize_locks(lock1: Lock, lock2: Lock):
+    """Initialize global locks for use by process pool."""
+
+    global rw_lock, stdo_lock
+
+    rw_lock = lock1
+    stdo_lock = lock2
 
 
 def spider_matches(account_ids: list, degrees: int = 1):
@@ -149,24 +183,19 @@ def spider_matches(account_ids: list, degrees: int = 1):
     if degrees < 1:
         raise ValueError('``degrees`` must be >= 1')
 
-    new_account_ids = set()
+    # new_account_ids = set()
 
-    for aid in account_ids:
-        try:
-            match_ids = get_matchlist(aid)
+    lock1 = Lock()
+    lock2 = Lock()
 
-            pickle.dump(match_ids, open('spider/accounts/{}'.format(aid), 'wb'))
+    pool = Pool(initializer=initialize_locks, initargs=(lock1, lock2))
 
-            new_matches = get_matches(*match_ids)
+    pool.imap_unordered(get_matches_for_account, account_ids)
+    pool.close()
+    pool.join()
 
-            if degrees > 1:
-                new_aids = get_account_ids_from_match(*new_matches)
-
-                new_account_ids |= set(new_aids) - set(account_ids)
-        except requests.exceptions.HTTPError:
-            continue
-
-    if len(new_account_ids) > 0 and degrees > 1:
+    '''  # Rework to not use local ``new_account_ids``
+    if degrees > 1:
         print('\nFound {} new accounts, spidering to matches.\n'.format(
             len(new_account_ids)))
 
@@ -177,22 +206,27 @@ def spider_matches(account_ids: list, degrees: int = 1):
 
         print('\n\nSpidered to {} accounts and {} matches.'.format(
             n_accounts, n_matches))
+    '''
 
 
 if __name__ == '__main__':
     # get_seed_data()
     # seed_accounts()
 
-    SUMMONERS = (
-        'HushRaze',
-        'PowerK00K',
-        'VanityDemon',
-        'ILovePhoKingLOL',
-        '19970809',
-        'Miss Nini'
-    )
+    SUMMONERS = [
+        39016347,  # HushRaze
+        39137330,  # PowerK00K
+        39010660,  # VanityDemon
+        35765317,  # ILovePhoKingLOL
+        33662222,  # 19970809
+        202637677  # Miss Nini
+    ]
 
     ACCOUNTS = pickle.load(open('seed/account_ids.pickle', 'rb'))
-    ACCOUNTS = list(set(ACCOUNTS + get_account_ids_from_name(*SUMMONERS)))
+    ACCOUNTS = list(set(ACCOUNTS + SUMMONERS))
 
-    spider_matches(ACCOUNTS, degrees=5)
+    print('{} seed accounts'.format(len(ACCOUNTS)))
+
+    spider_matches(ACCOUNTS)
+
+    print('done')
